@@ -4963,6 +4963,21 @@ impl Project {
         Project::respond_to_open_buffer_request(this, buffer, peer_id, &mut cx)
     }
 
+    async fn handle_get_directory_environment(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GetDirectoryEnvironment>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::DirectoryEnvironment> {
+        let shell = Shell::from_proto(envelope.payload.shell.context("missing shell")?)?;
+        let directory = PathBuf::from(envelope.payload.directory);
+        let environment = this
+            .update(&mut cx, |this, cx| {
+                this.directory_environment(shell, directory.into(), cx)
+            })?
+            .await?;
+        Ok(proto::DirectoryEnvironment { environment })
+    }
+
     fn respond_to_open_buffer_request(
         this: Entity<Self>,
         buffer: Entity<Buffer>,
