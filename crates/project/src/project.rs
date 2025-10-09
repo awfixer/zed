@@ -66,7 +66,7 @@ pub use environment::ProjectEnvironment;
 #[cfg(test)]
 use futures::future::join_all;
 use futures::{
-    StreamExt,
+    FutureExt as _, StreamExt,
     channel::mpsc::{self, UnboundedReceiver},
     future::{Shared, try_join_all},
 };
@@ -1894,12 +1894,32 @@ impl Project {
         })
     }
 
+    // FIXME migrate project environment stuff to use proto instead of bailing when not local
+
     pub fn directory_environment(
         &self,
         shell: &Shell,
         abs_path: Arc<Path>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        if let Some(remote_client) = self.remote_client() {
+            let response =
+                remote_client
+                    .read(cx)
+                    .proto_client()
+                    .request(proto::GetDirectoryEnvironment {
+                        // FIXME
+                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        shell: Some(shell.clone().to_proto()),
+                        directory: abs_path.to_string_lossy().to_string(),
+                    });
+            return cx
+                .spawn(async move |_| {
+                    let environment = response.await.log_err()?;
+                    Some(environment.environment.into_iter().collect())
+                })
+                .shared();
+        }
         self.environment.update(cx, |environment, cx| {
             environment.get_directory_environment_for_shell(shell, abs_path, cx)
         })
@@ -4961,21 +4981,6 @@ impl Project {
         let peer_id = envelope.original_sender_id()?;
 
         Project::respond_to_open_buffer_request(this, buffer, peer_id, &mut cx)
-    }
-
-    async fn handle_get_directory_environment(
-        this: Entity<Self>,
-        envelope: TypedEnvelope<proto::GetDirectoryEnvironment>,
-        mut cx: AsyncApp,
-    ) -> Result<proto::DirectoryEnvironment> {
-        let shell = Shell::from_proto(envelope.payload.shell.context("missing shell")?)?;
-        let directory = PathBuf::from(envelope.payload.directory);
-        let environment = this
-            .update(&mut cx, |this, cx| {
-                this.directory_environment(shell, directory.into(), cx)
-            })?
-            .await?;
-        Ok(proto::DirectoryEnvironment { environment })
     }
 
     fn respond_to_open_buffer_request(

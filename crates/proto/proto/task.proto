@@ -56,5 +56,5 @@ message GetDirectoryEnvironment {
 }
 
 message DirectoryEnvironment {
-    map<string, string> env = 1;
+    map<string, string> environment = 1;
 }
