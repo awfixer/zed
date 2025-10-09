@@ -649,8 +649,7 @@ impl Fs for RealFs {
         let path = path.to_path_buf();
         self.executor
             .spawn(async move {
-                Ok(std::fs::canonicalize(&path)
-                    .with_context(|| format!("canonicalizing {path:?}"))?)
+                std::fs::canonicalize(&path).with_context(|| format!("canonicalizing {path:?}"))
             })
             .await
     }
