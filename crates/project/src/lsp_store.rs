@@ -90,7 +90,7 @@ use parking_lot::Mutex;
 use postage::{mpsc, sink::Sink, stream::Stream, watch};
 use rand::prelude::*;
 use rpc::{
-    AnyProtoClient,
+    AnyProtoClient, ErrorCode, ErrorExt as _,
     proto::{LspRequestId, LspRequestMessage as _},
 };
 use serde::Serialize;
@@ -113,7 +113,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{self, AtomicUsize},
+        atomic::{self, AtomicBool, AtomicUsize},
     },
     time::{Duration, Instant},
 };
@@ -6496,9 +6496,9 @@ impl LspStore {
         invalidate: InvalidationStrategy,
         buffer: Entity<Buffer>,
         range: Range<text::Anchor>,
+        known_chunks: Option<(clock::Global, HashSet<Range<BufferRow>>)>,
         cx: &mut Context<Self>,
-    ) -> Task<Result<HashMap<Range<BufferRow>, CacheInlayHints>>> {
-        let buffer_version = buffer.read(cx).version();
+    ) -> HashMap<Range<BufferRow>, Task<Result<CacheInlayHints>>> {
         let buffer_snapshot = buffer.read(cx).snapshot();
         let buffer_id = buffer.read(cx).remote_id();
         let for_server = if let InvalidationStrategy::RefreshRequested(server_id) = invalidate {
@@ -6510,18 +6510,18 @@ impl LspStore {
         let next_hint_id = self.next_hint_id.clone();
         let lsp_data = self.latest_lsp_data(&buffer, cx);
         let existing_inlay_hints = &mut lsp_data.inlay_hints;
+        let known_ranges = known_chunks
+            .filter(|(known_version, _)| !lsp_data.buffer_version.changed_since(known_version))
+            .map(|(_, known_ranges)| known_ranges)
+            .unwrap_or_default();
 
         let mut hint_fetch_tasks = Vec::new();
         let mut cached_inlay_hints = HashMap::default();
         let mut ranges_to_query = Vec::new();
         let applicable_chunks = existing_inlay_hints
             .applicable_chunks(&range)
+            .filter(|chunk| !known_ranges.contains(&(chunk.start..chunk.end)))
             .collect::<Vec<_>>();
-        debug_assert!(
-            !applicable_chunks.is_empty(),
-            "Found no chunks for buffer range {:?}",
-            range.to_point(&buffer_snapshot),
-        );
         for row_chunk in applicable_chunks {
             match (
                 existing_inlay_hints
@@ -6575,13 +6575,17 @@ impl LspStore {
             }
         }
 
+        let cached_chunk_data = cached_inlay_hints
+            .into_iter()
+            .map(|(row_chunk, hints)| (row_chunk, Task::ready(Ok(hints))))
+            .collect();
         if hint_fetch_tasks.is_empty() && ranges_to_query.is_empty() {
-            Task::ready(Ok(cached_inlay_hints
-                .into_iter()
-                .map(|(row_chunk, hints)| (row_chunk, hints))
-                .collect()))
+            cached_chunk_data
         } else {
+            let invalidate_cache = Arc::new(AtomicBool::new(invalidate_cache));
+            dbg!(ranges_to_query.len());
             for (chunk, range_to_query) in ranges_to_query {
+                let invalidate_cache = invalidate_cache.clone();
                 let next_hint_id = next_hint_id.clone();
                 let buffer = buffer.clone();
                 let new_inlay_hints = cx
@@ -6591,13 +6595,28 @@ impl LspStore {
                         })?;
                         new_fetch_task
                             .await
-                            .map(|new_hints_by_server| {
-                                new_hints_by_server
-                                    .into_iter()
-                                    .map(|(server_id, new_hints)| {
-                                        (
-                                            server_id,
-                                            new_hints
+                            .and_then(|new_hints_by_server| {
+                                lsp_store.update(cx, |lsp_store, cx| {
+                                    if dbg!(
+                                        invalidate_cache.fetch_and(false, atomic::Ordering::AcqRel)
+                                    ) {
+                                        if let Some(lsp_data) =
+                                            lsp_store.current_lsp_data(buffer_id)
+                                        {
+                                            dbg!("CCCCCCCClear", &lsp_data.inlay_hints);
+
+                                            lsp_data.inlay_hints.clear();
+                                        }
+                                    }
+
+                                    let lsp_data = lsp_store.latest_lsp_data(&buffer, cx);
+                                    let update_cache = !lsp_data
+                                        .buffer_version
+                                        .changed_since(&buffer.read(cx).version());
+                                    new_hints_by_server
+                                        .into_iter()
+                                        .map(|(server_id, new_hints)| {
+                                            let new_hints = new_hints
                                                 .into_iter()
                                                 .map(|new_hint| {
                                                     (
@@ -6608,10 +6627,18 @@ impl LspStore {
                                                         new_hint,
                                                     )
                                                 })
-                                                .collect(),
-                                        )
-                                    })
-                                    .collect()
+                                                .collect::<Vec<_>>();
+                                            if dbg!(update_cache) {
+                                                lsp_data.inlay_hints.insert_new_hints(
+                                                    chunk,
+                                                    server_id,
+                                                    new_hints.clone(),
+                                                );
+                                            }
+                                            (server_id, dbg!(new_hints))
+                                        })
+                                        .collect()
+                                })
                             })
                             .map_err(Arc::new)
                     })
@@ -6622,66 +6649,22 @@ impl LspStore {
                 hint_fetch_tasks.push((chunk, new_inlay_hints));
             }
 
-            cx.spawn(async move |lsp_store, cx| {
-                let new_inlay_hints = join_all(
-                    hint_fetch_tasks
-                        .into_iter()
-                        .map(|(chunk, task)| async move { (chunk, task.await) }),
-                )
-                .await;
-                let mut combined_hints = cached_inlay_hints
-                    .into_iter()
-                    .map(|(chunk, cached_hints)| (chunk, cached_hints))
-                    .collect::<HashMap<_, _>>();
-                lsp_store.update(cx, |lsp_store, cx| {
-                    if !invalidate_cache
-                        && lsp_store
-                            .current_lsp_data(buffer_id)
-                            .is_some_and(|lsp_data| lsp_data.buffer_version != buffer_version)
-                    {
-                        combined_hints.clear();
-                        return;
-                    }
-
-                    let lsp_data = lsp_store.latest_lsp_data(&buffer, cx);
-                    if lsp_data.buffer_version.changed_since(&buffer_version) {
-                        combined_hints.clear();
-                        return;
-                    }
-
-                    let buffer_hints = &mut lsp_data.inlay_hints;
-                    if invalidate_cache {
-                        buffer_hints.clear();
-                    }
-
-                    for (chunk, new_inlay_hints) in new_inlay_hints {
-                        match new_inlay_hints {
-                            Ok(new_hints) => {
-                                let combined_hints =
-                                    combined_hints.entry(chunk.start..chunk.end).or_default();
-                                for (server_id, new_hints) in new_hints {
-                                    if for_server.is_none_or(|for_server| for_server == server_id) {
-                                        combined_hints
-                                            .entry(server_id)
-                                            .or_insert_with(Vec::new)
-                                            .extend(new_hints.clone());
-                                        buffer_hints.insert_new_hints(chunk, server_id, new_hints);
-                                    }
-                                }
+            let mut combined_data = cached_chunk_data;
+            combined_data.extend(hint_fetch_tasks.into_iter().map(|(chunk, hints_fetch)| {
+                (
+                    chunk.start..chunk.end,
+                    cx.spawn(async move |_, _| {
+                        hints_fetch.await.map_err(|e| {
+                            if e.error_code() != ErrorCode::Internal {
+                                anyhow!(e.error_code())
+                            } else {
+                                anyhow!("{e:#}")
                             }
-                            Err(e) => log::error!(
-                                "Error when fetching hints for buffer row range {}..{}: {:#}",
-                                chunk.start,
-                                chunk.end,
-                                e,
-                            ),
-                        }
-
-                        *buffer_hints.fetched_hints(&chunk) = None;
-                    }
-                })?;
-                Ok(combined_hints)
-            })
+                        })
+                    }),
+                )
+            }));
+            combined_data
         }
     }
 
@@ -6778,7 +6761,6 @@ impl LspStore {
                     .into_iter()
                     .map(|(server_id, mut new_hints)| {
                         new_hints.retain(|hint| {
-                            // TODO kb multi buffer is eager to hide the hints which is wrong, is this due to this?
                             hint.position.is_valid(&buffer_snapshot)
                                 && range.start.is_valid(&buffer_snapshot)
                                 && range.end.is_valid(&buffer_snapshot)
